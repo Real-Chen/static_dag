@@ -40,7 +40,7 @@ HTTP 409 冲突作为 submit_task 的 JSON 结果返回原 Agent，同时在 rep
 
 独立 DAG 页面使用公开 route 插件接口和 OpenTUI/Solid 渲染，不使用搜索弹窗，没有聊天背景。页面显示完成数、固定/实时耗时、进度条和任务表格；每个任务一行，状态/依赖/PR 分列。鼠标点击或方向键加 Enter 进入该节点的原生会话。未启动的节点不可进入。`/dag_panel` 重新打开页面，`/dag_status` 刷新服务器状态，`/dag_cancel` 请求停止当前 Agent 并阻止后续节点。页内 r 刷新、c 取消（仅运行中有效）、Esc 返回主会话。DAG 任务详情中按 ↑ 或点击底部「返回 DAG 看板」直接返回所属运行批次并选中原任务，不再先返回父会话；普通会话不改动，弹窗打开时保持原生按键行为。Ctrl+p 选择「DAG 任务面板」仍可作为备用入口。取消不回滚已合入提交，离开页面不会取消后台运行。单依赖 Fork 可能以独立会话显示，不修改数据库伪造 parentID。
 
-TUI 模块必须单独注册到 `tui.json` 的 plugin 数组，路径是本项目的 `src/dag_run/tui.js`（绝对路径或 file URL）；普通 server plugin 自动发现不会加载 TUI 模块。本机已全局注册。server 插件仍通过原有全局 shim 加载。没有修改 OpenCode 本体。
+通过 `opencode plugin --global deveco-dag@0.4.1 --force` 安装时，会根据 npm 包的 ./server 和 ./tui 入口注册服务端与 TUI。在全局 opencode.json(c) 和 tui.json 的 plugin 数组中使用 `deveco-dag@0.4.1`；不需要源码路径或 plugins 目录下的本地 shim。本项目不再提供自动加载源码的项目入口，开发验证通过测试配置显式加载。没有修改 OpenCode 本体。
 
 主聊天不显示控制或进度状态块，运行信息统一在独立页面。页面按 session 和运行批次关联主 DAG，进入 Fork 会话后仍能返回。完成后不再显示取消提示，耗时停止更新；兼容旧版进度记录的耗时。OpenCode 原生 Fork 会保留历史 session.directory，子会话的宿主路径提示可能显示来源路径；实际工具目录经 Workspace ID 和 git 工具上下文校验，任务消息中的 currentWorktree 为真实执行目录。
 
