@@ -14,8 +14,9 @@ await mkdir(repo); await git(repo, ['init', '-q', '-b', 'main']);
 await git(repo, ['config', 'user.name', 'Managed runtime fixture']); await git(repo, ['config', 'user.email', 'managed@example.invalid']);
 await writeFile(join(repo, '.gitignore'), '.dag/\n'); await writeFile(join(repo, 'README.md'), '# Managed host fixture\n');
 await git(repo, ['add', '.']); await git(repo, ['commit', '-qm', 'baseline']); await mkdir(join(repo, '.dag'));
-await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({tasks: [1, 2].map(id => ({id, title: `Task ${id}`, description: 'Write a task file', dependencies: id === 1 ? [] : [1], testStrategy: 'Check output file'}))}));
-const steps = new Map(); let failure;
+await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({tasks: [[], [1], [1], [2, 3]].map((dependencies, i) => ({id: i + 1, title: `Task ${i + 1}`, description: 'Write a task file', dependencies, testStrategy: 'Check output file'}))}));
+const steps = new Map(), parallelWorkers = new Set(); let failure, releaseParallel;
+const parallelBarrier = new Promise(resolve => releaseParallel = resolve);
 const model = http.createServer(async (req, res) => {
   try {
     let raw = ''; for await (const bytes of req) raw += bytes;
@@ -24,7 +25,12 @@ const model = http.createServer(async (req, res) => {
     if (names.includes('submit_task')) {
       const content = body.messages.findLast(m => m.role === 'user').content;
       const input = parseWorkerInput(typeof content === 'string' ? content : content.map(x => x.text ?? '').join('\n'));
-      const id = input.id, n = steps.get(id) ?? 0; steps.set(id, n + 1);
+      const id = input.id, n = steps.get(id) ?? 0;
+      if ((id === 2 || id === 3) && n === 0) {
+        parallelWorkers.add(id); if (parallelWorkers.size === 2) releaseParallel();
+        await Promise.race([parallelBarrier, new Promise((_, reject) => {const timer = setTimeout(() => reject(new Error('Real Gitea fixture did not run both forks concurrently')), 25000); timer.unref();})]);
+      }
+      steps.set(id, n + 1);
       assert.ok(n < 15, 'Unexpected worker retry loop');
       const operations = [['write', {filePath: join(input.worktree, `task-${id}.txt`), content: `Task ${id}\n`}],
         ['git', {args: ['add', '.']}], ['git', {args: ['commit', '-m', `Task ${id}`]}], ['submit_task', {summary: 'Managed runtime test'}]];
@@ -46,7 +52,8 @@ await new Promise(resolve => model.listen(0, '127.0.0.1', resolve));
 const config = {plugin: [pathToFileURL(join(packageRoot, 'src/plugin.js')).href], model: 'fixture/fake', small_model: 'fixture/fake', enabled_providers: ['fixture'], autoupdate: false,
   provider: {fixture: {npm: '@ai-sdk/openai-compatible', options: {baseURL: `http://127.0.0.1:${model.address().port}/v1`, apiKey: 'fixture'}, models: {fake: {name: 'fake', limit: {context: 64000, output: 4000}}}}}};
 const host = spawn(process.env.OPENCODE_BIN ?? 'D:/APP/node_js/node_modules/opencode-ai/bin/opencode.exe', ['serve', '--hostname', '127.0.0.1', '--port', '0'], {cwd: repo, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-  env: {...process.env, DEVECO_DAG_DATA_DIR: data, OPENCODE_EXPERIMENTAL_WORKSPACES: 'true', GITEA_TOKEN: 'wrong-global-token', OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_SERVER_USERNAME: 'fixture', OPENCODE_SERVER_PASSWORD: 'fixture'}});
+  env: {...process.env, XDG_CONFIG_HOME: join(fixture, 'config'), XDG_DATA_HOME: join(fixture, 'host-data'), XDG_STATE_HOME: join(fixture, 'state'), XDG_CACHE_HOME: join(fixture, 'cache'), OPENCODE_CONFIG_DIR: join(fixture, 'config/opencode'),
+    DEVECO_DAG_DATA_DIR: data, OPENCODE_EXPERIMENTAL_WORKSPACES: 'true', GITEA_TOKEN: 'wrong-global-token', OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_SERVER_USERNAME: 'fixture', OPENCODE_SERVER_PASSWORD: 'fixture'}});
 let logs = '', passed = false;
 host.stdout.on('data', x => logs += x); host.stderr.on('data', x => logs += x);
 const until = async (read, valid, timeout = 180000) => {
@@ -63,15 +70,32 @@ try {
   const parent = await api('/session', {title: 'Real managed Gitea + OpenCode'});
   await api(`/session/${parent.id}/message`, {noReply: true, parts: [{type: 'text', text: '/dag_run', synthetic: true, ignored: true,
     metadata: {dagControl: {action: 'start', root: repo, requestId: crypto.randomUUID(), issuedAt: Date.now()}}}]});
-  const state = await until(async () => {const [id] = await readdir(join(repo, '.dag/runs')); return JSON.parse(await readFile(join(repo, '.dag/runs', id, 'state.json'), 'utf8'));}, x => x && x.status !== 'running');
+  let parallelViewObserved = false;
+  const state = await until(async () => {
+    const [id] = await readdir(join(repo, '.dag/runs'));
+    const current = JSON.parse(await readFile(join(repo, '.dag/runs', id, 'state.json'), 'utf8'));
+    if (!parallelViewObserved && current.tasks[1].status === 'running' && current.tasks[2].status === 'running') {
+      const messages = await api(`/session/${parent.id}/message`);
+      parallelViewObserved = messages.flatMap(message => message.parts).some(part => {
+        const view = part.metadata?.dagView;
+        return view?.maxConcurrency === 20 && [2, 3].every(id => view.tasks.some(task => task.id === id && task.status === 'running'));
+      });
+    }
+    return current;
+  }, x => x && x.status !== 'running');
   if (failure) throw failure;
   assert.equal(state.status, 'done', JSON.stringify(state));
-  assert.equal(state.tasks[0].pr, 1); assert.equal(state.tasks[1].pr, 2);
+  assert.equal(state.maxConcurrency, 20); assert.equal(parallelWorkers.size, 2);
+  assert.equal(parallelViewObserved, true, '看板数据应同时显示节点 2 和 3 执行中');
+  assert.equal(state.tasks[0].pr, 1); assert.equal(state.tasks[3].pr, 4);
+  assert.deepEqual(state.tasks.map(task => task.pr).sort((a, b) => a - b), [1, 2, 3, 4]);
   assert.equal(state.tasks[1].forkedFrom, state.tasks[0].session);
-  assert.equal((await readFile(join(repo, 'task-2.txt'), 'utf8')).trim(), 'Task 2');
-  assert.equal(await git(repo, ['rev-parse', 'HEAD']), state.tasks[1].mergeCommit);
+  assert.equal(state.tasks[2].forkedFrom, state.tasks[0].session); assert.equal(state.tasks[3].forkedFrom, null);
+  assert.ok(state.tasks[3].startedAt >= Math.max(state.tasks[1].finishedAt, state.tasks[2].finishedAt));
+  for (const task of state.tasks) assert.equal((await readFile(join(repo, `task-${task.id}.txt`), 'utf8')).trim(), `Task ${task.id}`);
+  assert.equal(await git(repo, ['rev-parse', 'HEAD']), state.tasks[3].mergeCommit);
   console.log(JSON.stringify({passed: true, nativeOpenCode: true, bundledGiteaFirstUse: true, noRunnerConfig: true,
-    nativeWorkerGitCredentials: true, forkedAcrossWorktrees: true, prs: state.tasks.map(x => x.pr)}));
+    nativeWorkerGitCredentials: true, forkedAcrossWorktrees: true, concurrentForks: true, dashboardShowsBothRunning: true, joinWaitsForBoth: true, prs: state.tasks.map(x => x.pr)}));
   if (process.env.DAG_TUI_SMOKE === '1') {
     console.log(JSON.stringify({tuiFixture: fixture, repo, origin: url, sessionID: parent.id}));
     await until(() => readFile(join(fixture, 'ui.done')), Boolean, 600000);

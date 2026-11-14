@@ -1,4 +1,5 @@
 {
+  "maxConcurrency": 20,
   "baseBranch": "main",
   "gitea": {
     "url": "https://gitea.example.com",

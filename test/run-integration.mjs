@@ -62,13 +62,16 @@ const provider = http.createServer(async (req, res) => {
   } catch (error) { res.writeHead(500); res.end(JSON.stringify({ message: error.message })); }
 });
 await new Promise(r => provider.listen(0, '127.0.0.1', r));
-const tasks = [[], [1], [], [2, 3]].map((dependencies, i) => ({ id: i + 1, title: `fixture-${i + 1}`, description: '开发测试文件', details: '按任务写文件并提交', testStrategy: '文件内容核对', dependencies }));
+const tasks = [[], [1], [1], [2, 3]].map((dependencies, i) => ({ id: i + 1, title: `fixture-${i + 1}`, description: '开发测试文件', details: '按任务写文件并提交', testStrategy: '文件内容核对', dependencies }));
 await mkdir(join(repo, '.dag'));
 await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({ tasks }));
 await writeFile(join(repo, '.dag/runner.json'), JSON.stringify({ remote: 'origin', baseBranch: 'main', gitea: { url: `http://127.0.0.1:${provider.address().port}`, owner: 'test', repo: 'fixture' } }));
 const steps = new Map(), workerDirectories = new Map(), repairs = new Map(); let failure, completed = false, requestCount = 0;
 const progressSnapshots = [];
-let holdWorker = false, heldWorker = false;
+let holdWorker = false;
+const heldWorkers = new Set(), stoppedWorkers = new Set(), parallelWorkers = new Set();
+let releaseParallel;
+const parallelBarrier = new Promise(resolve => releaseParallel = resolve);
 const text = content => typeof content === 'string' ? content : (content ?? []).map(p => p.text ?? '').join('\n');
 const call = (name, args) => ({ tool_calls: [{ id: 'call-' + Math.random().toString(36).slice(2), type: 'function', function: { name, arguments: JSON.stringify(args) } }] });
 function reply(res, value) {
@@ -82,12 +85,18 @@ const model = http.createServer(async (req, res) => {
     requestCount++; if (requestCount > 65) throw new Error('测试模型检测到异常循环');
     assert.ok(!names.includes('dag_next'), '模型不应看到 dag_next 工具');
     if (!names.includes('submit_task')) return reply(res, { content: 'DAG runner test' });
+    const input = parseWorkerInput(text(body.messages.findLast(m => m.role === 'user').content)), id = input.id, cwd = input.worktree;
     if (holdWorker) {
-      heldWorker = true;
+      heldWorkers.add(id);
       await new Promise(resolve => res.once('close', resolve));
+      stoppedWorkers.add(id);
       return;
     }
-    const input = parseWorkerInput(text(body.messages.findLast(m => m.role === 'user').content)), id = input.id, cwd = input.worktree;
+    if ((id === 2 || id === 3) && !steps.has(id)) {
+      parallelWorkers.add(id);
+      if (parallelWorkers.size === 2) releaseParallel();
+      await Promise.race([parallelBarrier, new Promise((_, reject) => {const timer = setTimeout(() => reject(new Error('节点 2、3 未同时进入模型执行')), 25000); timer.unref();})]);
+    }
     if (!workerDirectories.has(id)) await assert.rejects(readFile(join(cwd, 'remote-only.txt')), {code: 'ENOENT'});
     workerDirectories.set(id, cwd);
     const file = join(cwd, id === 2 ? 'shared.txt' : `node-${id}.txt`);
@@ -109,7 +118,9 @@ const model = http.createServer(async (req, res) => {
 await new Promise(r => model.listen(0, '127.0.0.1', r));
 const config = { plugin: [pathToFileURL(resolve(process.env.DAG_PLUGIN_PATH ?? 'src/plugin.js')).href], model: 'fixture/fake', small_model: 'fixture/fake', enabled_providers: ['fixture'], autoupdate: false,
  provider: { fixture: { name: 'test', npm: '@ai-sdk/openai-compatible', options: { baseURL: `http://127.0.0.1:${model.address().port}/v1`, apiKey: 'fixture' }, models: { fake: { name: 'fake', limit: { context: 64000, output: 4000 } } } } } };
-const child = spawn(process.env.OPENCODE_BIN ?? 'D:\\APP\\node_js\\node_modules\\opencode-ai\\bin\\opencode.exe', ['serve', '--hostname', '127.0.0.1', '--port', '0'], { cwd: repo, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, OPENCODE_EXPERIMENTAL_WORKSPACES: 'true', OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_SERVER_PASSWORD: 'fixture-password', OPENCODE_SERVER_USERNAME: 'fixture', GITEA_TOKEN: 'fixture-token' } });
+const child = spawn(process.env.OPENCODE_BIN ?? 'D:\\APP\\node_js\\node_modules\\opencode-ai\\bin\\opencode.exe', ['serve', '--hostname', '127.0.0.1', '--port', '0'], { cwd: repo, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env,
+  XDG_CONFIG_HOME: join(fixture, 'config'), XDG_DATA_HOME: join(fixture, 'data'), XDG_STATE_HOME: join(fixture, 'state'), XDG_CACHE_HOME: join(fixture, 'cache'), OPENCODE_CONFIG_DIR: join(fixture, 'config/opencode'),
+  OPENCODE_EXPERIMENTAL_WORKSPACES: 'true', OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_SERVER_PASSWORD: 'fixture-password', OPENCODE_SERVER_USERNAME: 'fixture', GITEA_TOKEN: 'fixture-token' } });
 let logs = ''; child.stdout.on('data', d => logs += d); child.stderr.on('data', d => logs += d);
 try {
   let origin; for (let i = 0; i < 600; i++) { origin = logs.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0]; if (origin) break; await new Promise(r => setTimeout(r, 50)); }
@@ -168,6 +179,7 @@ try {
   assert.equal(state.status, 'done', JSON.stringify(state.tasks.map(t => ({ id: t.id, status: t.status, error: t.error }))));
   assert.ok(actualConflict); assert.equal(prCount, 4); assert.equal(workerDirectories.size, 4);
   assert.equal(state.initialCommit, initialCommit);
+  assert.equal(state.maxConcurrency, 20);
   assert.equal(state.localBranch, 'main');
   assert.equal(state.integrationBranch, `dag/${runId}/integration`);
   const firstRepository = repositories.get(state.gitea.repo);
@@ -178,7 +190,10 @@ try {
   assert.equal(await git(repo, ['remote', 'get-url', 'origin']), remote);
   await assert.rejects(readFile(join(repo, 'remote-only.txt')), {code: 'ENOENT'});
   await assert.rejects(git(repo, ['merge-base', '--is-ancestor', oldRemoteMain, 'HEAD']), '旧远端提交不得进入本轮历史');
-  assert.equal(state.tasks[1].forkedFrom, state.tasks[0].session); assert.equal(state.tasks[2].forkedFrom, null); assert.equal(state.tasks[3].forkedFrom, null);
+  assert.equal(state.tasks[1].forkedFrom, state.tasks[0].session); assert.equal(state.tasks[2].forkedFrom, state.tasks[0].session); assert.equal(state.tasks[3].forkedFrom, null);
+  assert.equal(parallelWorkers.size, 2);
+  assert.ok(state.tasks[1].startedAt < state.tasks[2].finishedAt && state.tasks[2].startedAt < state.tasks[1].finishedAt);
+  assert.ok(state.tasks[3].startedAt >= Math.max(state.tasks[1].finishedAt, state.tasks[2].finishedAt));
   for (const task of state.tasks) { assert.equal(task.status, 'done'); assert.equal(await git(task.worktree, ['branch', '--show-current']), task.branch); }
   assert.equal((await readFile(join(repo, 'shared.txt'), 'utf8')).trim(), 'node 2 and upstream reconciled');
   const messages = await api(`/session/${source.id}/message`);
@@ -193,7 +208,7 @@ try {
   assert.ok(progressSnapshots.some(text => /执行中/.test(text) && /git/.test(text)), 'TUI 应收到节点执行期间的原生进度事件');
   assert.ok(progressSnapshots.some(text => /conflict/.test(text)), '冲突应显示在进度中');
   console.log(JSON.stringify({ passed: true, tasks: 4, real_opencode: true, real_git: true, mock_gitea_api: true, local_reset_respected: true,
-    old_remote_main_unchanged: true, all_prs_target_run_branch: true, fork_directory_verified: true, conflict_repaired: true, progress_events: progressSnapshots.length, requests: requestCount }));
+    old_remote_main_unchanged: true, all_prs_target_run_branch: true, fork_directory_verified: true, conflict_repaired: true, concurrent_forks_2_and_3: true, join_waits_for_both: true, progress_events: progressSnapshots.length, requests: requestCount }));
   if (process.env.DAG_TUI_SMOKE === '1') {
     console.log(JSON.stringify({tuiFixture: fixture, repo, origin, sessionID: source.id}));
     while (true) { try { await readFile(join(fixture, 'ui.done')); break; } catch { await new Promise(r => setTimeout(r, 250)); } }
@@ -221,16 +236,17 @@ try {
   // A real idle/running native child must be aborted; no downstream task or PR
   // may start just because the controlling parent has no active model turn.
   holdWorker = true;
-  await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({tasks}));
+  await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({tasks: tasks.slice(0, 3).map((task, index) => ({...task, dependencies: index === 2 ? [1, 2] : []}))}));
   const cancelledSource = await api('/session', 'POST', {title: 'DAG cancellation fixture'});
   await control(cancelledSource.id, 'start');
-  await until(async () => heldWorker, value => value);
+  await until(async () => heldWorkers.size, value => value === 2);
   await control(cancelledSource.id, 'cancel');
   const cancelledParts = await until(async () => (await api(`/session/${cancelledSource.id}/message`)).flatMap(m => m.parts),
     parts => parts.some(p => p.metadata?.dagView?.status === 'cancelled'));
   const cancelled = cancelledParts.find(p => p.metadata?.dagView)?.metadata.dagView;
-  assert.equal(cancelled.tasks[0].status, 'cancelled');
-  assert.ok(cancelled.tasks.slice(1).every(task => task.status === 'blocked' && !task.session));
+  assert.ok(cancelled.tasks.slice(0, 2).every(task => task.status === 'cancelled'));
+  await until(async () => stoppedWorkers.size, value => value === 2);
+  assert.ok(cancelled.tasks.slice(2).every(task => task.status === 'blocked' && !task.session));
   assert.equal(prCount, 5, '取消不能产生后续 PR');
   console.log(JSON.stringify({cancellation_verified: true, downstream_started: false}));
 } catch (error) { console.error(error.stack, '\nSERVER', logs.slice(-2500)); process.exitCode = 1; }

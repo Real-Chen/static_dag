@@ -52,8 +52,12 @@ const config = { model: 'fixture/fake', small_model: 'fixture/fake', enabled_pro
     options: { baseURL: `http://127.0.0.1:${model.address().port}/v1`, apiKey: 'local-test-only' }, models: { fake: { name: 'fake', limit: { context: 64000, output: 4000 } } } } } };
 if (process.argv.includes('--global')) delete config.plugin;
 const password = randomUUID();
+const isolated = process.argv.includes('--global') ? {} : {
+  XDG_CONFIG_HOME: join(fixture, 'config'), XDG_DATA_HOME: join(fixture, 'data'), XDG_STATE_HOME: join(fixture, 'state'),
+  XDG_CACHE_HOME: join(fixture, 'cache'), OPENCODE_CONFIG_DIR: join(fixture, 'config/opencode')
+};
 const child = spawn(process.env.OPENCODE_BIN ?? 'D:\\APP\\node_js\\node_modules\\opencode-ai\\bin\\opencode.exe', ['serve', '--hostname', '127.0.0.1', '--port', '0'], {
-  cwd: directory, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_SERVER_USERNAME: 'dag-test', OPENCODE_SERVER_PASSWORD: password } });
+  cwd: directory, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...isolated, OPENCODE_CONFIG_CONTENT: JSON.stringify(config), OPENCODE_SERVER_USERNAME: 'dag-test', OPENCODE_SERVER_PASSWORD: password } });
 let logs = ''; child.stdout.on('data', d => logs += d); child.stderr.on('data', d => logs += d);
 try {
   const origin = await new Promise((done, reject) => {

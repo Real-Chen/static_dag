@@ -57,7 +57,7 @@ try {
   assert.equal((await git(repo, ['ls-remote', 'origin', 'refs/heads/main'])).split(/\s+/)[0], oldRemoteMain);
   assert.equal((await readFile(join(repo, 'task-result.txt'), 'utf8')).trim(), `Result from local baseline, run ${round}.`);
   await assert.rejects(readFile(join(repo, 'remote-only.txt')), {code: 'ENOENT'});
-  await run.step({abort: new AbortController().signal, metadata() {}});
+  await run.complete();
   assert.equal(run.state.status, 'done');
   evidence.push({round, repository: run.state.gitea.htmlUrl, pr: pr.html_url, number: task.pr, initialCommit: roundBaseline, mergeCommit: result.mergeCommit});
   }

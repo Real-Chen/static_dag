@@ -32,7 +32,9 @@ Token 优先读取 `GITEA_TOKEN`，未设置时非交互读取当前仓库的 Gi
 
 OpenCode 1.19.5 的 Fork 路由优先绑定源会话 Workspace，单独指定新 directory 无效。本模块注册原生 `dag-task` Workspace adapter，通过 Workspace API 注册已创建的 Git worktree，Fork 后使用 `/sync/steal` 迁移归属并检查 Workspace ID；git 工具核对实际 ToolContext.directory。必须开启上述实验选项。本实现针对 1.19.5，不宣称兼容 2.x。
 
-`/dag_run` 是 TUI 插件命令，直接向服务器发送 noReply 控制消息，不调用模型启动。框架的 execute 循环自动选择依赖完成的节点并串行等待其结束，没有协调 Agent 或 dag_next 工具。主会话 idle 不会打断调度。单依赖使用真正的 session.fork；零依赖和多依赖创建新 session。每个节点独立 worktree/分支，所有节点使用相同 `worker.md`。多前置节点的报告、提交和 PR 信息在用户消息中注入。代码来自启动 worktree 的本轮基线及此前已确认合入的任务结果。
+`/dag_run` 是 TUI 插件命令，直接向服务器发送 noReply 控制消息，不调用模型启动。框架的 execute 循环按就绪队列并发调度，runner.json 中 maxConcurrency 为正整数，默认 20，设为 1 可串行执行。前置 PR 合并并同步且 Agent 最终回复结束后才可启动后继；有空位时立即调度，不等待整个批次。没有协调 Agent 或 dag_next 工具。主会话 idle 不会打断调度。单依赖使用真正的 session.fork；零依赖和多依赖创建新 session。每个节点独立 worktree/分支，所有节点使用相同 `worker.md`。多依赖新会话接收直接前置报告。代码来自启动 worktree 的本轮基线及此前已确认合入的任务结果。
+
+任务开发并发，但 worktree 基线创建与 submit_task 的 push/PR 合并/主工作区同步共用串行集成队列，避免 HEAD 校验和 Git 引用互相干扰。状态快照也按调用顺序写入。各 Agent 解决冲突时使用自己的修复引用，不争用主工作区的跟踪引用。取消或任一节点失败时，停止所有活动 Agent，等待已开始的集成操作收尾后再释放运行锁，未执行节点标为 blocked；已确认合并的提交保留。
 
 worker 可使用原生文件工具、bash 和额外 git 工具。在开发、测试并 git add/commit 后调用 `submit_task({summary})`；工具检查工作区干净、分支正确、有新 commit，然后 push、创建/复用 PR、请求合并并重新查询确认。只有启动 worktree 成功同步本轮 PR 的确切合并提交后才 done。测试由 Agent 执行报告，本版无独立强制机器验收器。开发输入使用 task.md 的可读模板，只传当前任务的标题、目标、实施说明、验收要求和一份工作目录。session、workspaceID、分支、提交、Gitea URL、remote 等运行状态保留在框架内。单依赖 Fork 不重复拼接前置报告；多依赖新会话仅附直接前置任务的报告。
 
@@ -40,7 +42,7 @@ HTTP 409 冲突作为 submit_task 的 JSON 结果返回原 Agent，同时在 rep
 
 独立 DAG 页面使用公开 route 插件接口和 OpenTUI/Solid 渲染，不使用搜索弹窗，没有聊天背景。页面显示完成数、固定/实时耗时、进度条和任务表格；每个任务一行，状态/依赖/PR 分列。鼠标点击或方向键加 Enter 进入该节点的原生会话。未启动的节点不可进入。`/dag_panel` 重新打开页面，`/dag_status` 刷新服务器状态，`/dag_cancel` 请求停止当前 Agent 并阻止后续节点。页内 r 刷新、c 取消（仅运行中有效）、Esc 返回主会话。DAG 任务详情中按 ↑ 或点击底部「返回 DAG 看板」直接返回所属运行批次并选中原任务，不再先返回父会话；普通会话不改动，弹窗打开时保持原生按键行为。Ctrl+p 选择「DAG 任务面板」仍可作为备用入口。取消不回滚已合入提交，离开页面不会取消后台运行。单依赖 Fork 可能以独立会话显示，不修改数据库伪造 parentID。
 
-通过 `opencode plugin --global deveco-dag@0.4.1 --force` 安装时，会根据 npm 包的 ./server 和 ./tui 入口注册服务端与 TUI。在全局 opencode.json(c) 和 tui.json 的 plugin 数组中使用 `deveco-dag@0.4.1`；不需要源码路径或 plugins 目录下的本地 shim。本项目不再提供自动加载源码的项目入口，开发验证通过测试配置显式加载。没有修改 OpenCode 本体。
+通过 `opencode plugin --global deveco-dag@0.5.0 --force` 安装时，会根据 npm 包的 ./server 和 ./tui 入口注册服务端与 TUI。在全局 opencode.json(c) 和 tui.json 的 plugin 数组中使用 `deveco-dag@0.5.0`；不需要源码路径或 plugins 目录下的本地 shim。本项目不再提供自动加载源码的项目入口，开发验证通过测试配置显式加载。没有修改 OpenCode 本体。
 
 主聊天不显示控制或进度状态块，运行信息统一在独立页面。页面按 session 和运行批次关联主 DAG，进入 Fork 会话后仍能返回。完成后不再显示取消提示，耗时停止更新；兼容旧版进度记录的耗时。OpenCode 原生 Fork 会保留历史 session.directory，子会话的宿主路径提示可能显示来源路径；实际工具目录经 Workspace ID 和 git 工具上下文校验，任务消息中的 currentWorktree 为真实执行目录。
 

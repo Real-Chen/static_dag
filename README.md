@@ -37,7 +37,7 @@ opencode
 
 每台电脑的当前 Windows 用户共用一个 Gitea 实例；每轮创建独立私有仓库 `<项目前缀>-<runId>`，首个任务 PR 从 `#1` 开始。新一轮以启动 worktree 的当前 HEAD 为基线，不清除已有代码提交；已确认的 PR 合并提交同步回本地，保留原 origin 配置。
 
-任务按依赖串行调度。只有一个前置节点时 Fork 其原生会话；没有前置节点或多个前置节点时创建新会话。所有节点使用 `src/dag_run/worker.md` 通用提示词，完成开发、测试和 git commit 后调用 submit_task。冲突通过工具结果返回同一个 Agent，解决后重试原 PR。
+任务按依赖并发调度，默认最多同时运行 20 个节点。前置任务的 PR 已合并、本地已同步且 Agent 会话结束后，后续节点才进入就绪队列；有空闲名额就立即启动，无需等待同批次的其他分支。只有一个前置节点时 Fork 其原生会话；没有前置节点或多个前置节点时创建新会话。所有节点使用 `src/dag_run/worker.md` 通用提示词，完成开发、测试和 git commit 后调用 submit_task。PR 提交合并与主工作区同步通过串行队列处理，冲突返回原 Agent 解决后重试。一个节点失败时停止其他活动节点并阻止后续任务。
 
 ## 本地数据
 
@@ -58,12 +58,13 @@ npx deveco-dag status
 
 ```json
 {
+  "maxConcurrency": 20,
   "baseBranch": "main",
   "gitea": {"repoPrefix": "my-project"}
 }
 ```
 
-也兼容通过 gitea.url、owner、repoPrefix 指定已有外部 Gitea，此时使用原生 Git 凭据和 GITEA_TOKEN/credential helper。旧 gitea.repo 字段仍可作为命名前缀。详见 src/dag_run/README.md。
+maxConcurrency 是正整数，默认为 20；设为 1 时串行执行。也兼容通过 gitea.url、owner、repoPrefix 指定已有外部 Gitea，此时使用原生 Git 凭据和 GITEA_TOKEN/credential helper。旧 gitea.repo 字段仍可作为命名前缀。详见 src/dag_run/README.md。
 
 ## 开发
 

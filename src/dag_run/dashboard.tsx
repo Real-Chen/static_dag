@@ -47,7 +47,7 @@ export function Dashboard(props) {
     <Show when={view()?.gitea?.repo}><text fg={theme().textMuted} truncate>本轮仓库：{view()?.gitea?.owner}/{view()?.gitea?.repo}</text></Show>
     <box backgroundColor={theme().backgroundPanel} padding={1} flexDirection="column" gap={1}>
       <box flexDirection="row" justifyContent="space-between">
-        <text fg={theme().text}>{done()} / {tasks().length} 个任务已完成</text>
+        <text fg={theme().text}>{done()} / {tasks().length} 个任务已完成 · 执行中 {tasks().filter(task => task.status === 'running').length} · 并发上限 {view()?.maxConcurrency ?? 1}</text>
         <text fg={theme().textMuted}>{elapsed()}</text>
       </box>
       <text fg={theme().primary}>{'━'.repeat(Math.round(percent() / 5))}<span fg={theme().textMuted}>{'─'.repeat(20 - Math.round(percent() / 5))}</span> {percent()}%</text>

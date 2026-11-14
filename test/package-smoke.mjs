@@ -57,7 +57,7 @@ try {
     assert.equal(submission.status, 'merged', JSON.stringify(submission));
     assert.equal(task.pr, 1);
     assert.equal(await git(repo, ['rev-parse', 'HEAD']), submission.mergeCommit);
-    await run.step({abort: new AbortController().signal, metadata() {}});
+    await run.complete();
     assert.equal(run.state.status, 'done');
     evidence.push({repo: run.state.gitea.repo, pr: task.pr});
   }

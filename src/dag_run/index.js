@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile, rename, unlink, open } from 'node:fs/promises';
 import { dirname, basename, join, resolve, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setMaxListeners } from 'node:events';
 import { parseDag } from '../dag.js';
 import { git, clean } from './git.js';
 import { Gitea } from './gitea.js';
@@ -9,8 +10,19 @@ import { loadRunnerConfig, enableWorkspaces } from '../runtime/local-gitea.js';
 import { taskInput } from './input.js';
 
 export const registry = globalThis[Symbol.for('static-dag.execution')] ??= { runs: new Map(), workers: new Map(), roots: new Map() };
+export const DEFAULT_MAX_CONCURRENCY = 20;
 const unwrap = value => { if (value.error || !value.data || value.data.info?.error) throw new Error(JSON.stringify(value.error ?? value.data?.info?.error ?? '宿主返回空结果')); return value.data; };
 export class DagRun {
+  constructor() {
+    this.active = new Map();
+    this.integrationTail = Promise.resolve();
+    this.saveTail = Promise.resolve();
+  }
+  integrate(operation) {
+    const next = this.integrationTail.then(operation);
+    this.integrationTail = next.catch(() => {});
+    return next;
+  }
   static async start(root, parent, client) {
     root = resolve(root);
     if (registry.roots.has(root)) throw new Error('当前 worktree 已有 DAG 在执行');
@@ -23,14 +35,18 @@ export class DagRun {
     if (await git(root, ['status', '--porcelain', '--untracked-files=no'])) throw new Error('主 worktree 有已跟踪文件的未提交修改，请先提交');
     if (!branch) throw new Error('请在目标主 worktree 的分支上运行 /dag_run，不能使用 detached HEAD');
     const {config, token} = await loadRunnerConfig(root);
+    config.maxConcurrency ??= DEFAULT_MAX_CONCURRENCY;
+    if (!Number.isSafeInteger(config.maxConcurrency) || config.maxConcurrency < 1) throw new Error('maxConcurrency 必须为正整数');
     config.baseBranch ??= branch;
     if (branch !== config.baseBranch) throw new Error('请在目标主 worktree 的 baseBranch 分支执行 /dag_run');
     const provider = new Gitea(config.gitea, token ?? await resolveGiteaToken(root, config.gitea));
     const initialCommit = await git(root, ['rev-parse', 'HEAD']);
     const run = new DagRun();
-    Object.assign(run, { root, parent, client, config, provider, busy: false,
+    Object.assign(run, { root, parent, client, config, provider,
       state: { id: randomUUID(), status: 'running', startedAt: Date.now(), localBranch: branch, initialCommit,
-        syncedCommit: initialCommit, tasks: dag.tasks.map(t => ({ ...t, status: 'pending' })) }, controller: new AbortController() });
+        syncedCommit: initialCommit, maxConcurrency: config.maxConcurrency, tasks: dag.tasks.map(t => ({ ...t, status: 'pending' })) }, controller: new AbortController() });
+    // Each active worker and its HTTP request observes this per-run signal.
+    setMaxListeners(0, run.controller.signal);
     run.state.integrationBranch = `dag/${run.state.id}/integration`;
     run.state.gitRemote = `dag-run-${run.state.id}`;
     run.state.integrationRef = `refs/remotes/${run.state.gitRemote}/${run.state.integrationBranch}`;
@@ -43,10 +59,16 @@ export class DagRun {
     try { await run.save(); } catch (error) { await run.release(); throw error; }
     return run;
   }
-  async save() {
+  save() {
+    const snapshot = JSON.stringify(this.state, null, 2);
+    const next = this.saveTail.then(() => this.writeSnapshot(snapshot));
+    this.saveTail = next.catch(() => {});
+    return next;
+  }
+  async writeSnapshot(snapshot) {
     await mkdir(this.dir, { recursive: true });
     const tmp = join(this.dir, `state.${randomUUID()}.tmp`), file = join(this.dir, 'state.json');
-    await writeFile(tmp, JSON.stringify(this.state, null, 2));
+    await writeFile(tmp, snapshot);
     for (let n = 0; ; n++) {
       try { await rename(tmp, file); break; }
       catch (error) { if (n >= 5 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) { await unlink(tmp).catch(() => {}); throw error; } await new Promise(r => setTimeout(r, 10 * 2 ** n)); }
@@ -102,12 +124,33 @@ export class DagRun {
       await this.initializeIntegration();
       while (this.state.status === 'running') {
         this.controller.signal.throwIfAborted();
-        await this.step({ abort: this.controller.signal, metadata() {} });
+        for (const task of this.ready()) {
+          if (this.active.size >= this.config.maxConcurrency) break;
+          task.status = 'running'; task.startedAt = Date.now();
+          const pending = this.runTask(task, {abort: this.controller.signal, metadata() {}})
+            .catch(error => {
+              if (!this.controller.signal.aborted) {
+                this.failure = error;
+                this.controller.abort(error);
+              }
+            }).finally(() => this.active.delete(task.id));
+          this.active.set(task.id, pending);
+        }
+        if (!this.active.size) {
+          await this.complete();
+          break;
+        }
+        await Promise.race(this.active.values());
       }
     } catch (error) {
       if (this.state.status === 'running') {
-        this.state.status = this.controller.signal.aborted ? 'cancelled' : 'failed';
-        this.state.error = error.message;
+        if (!this.controller.signal.aborted) {this.failure = error; this.controller.abort(error);}
+        // Do not release the worktree lock while sibling sessions or an already
+        // accepted PR merge can still be writing to the integration worktree.
+        await Promise.allSettled([...this.active.values()]);
+        await this.integrationTail;
+        this.state.status = this.failure ? 'failed' : 'cancelled';
+        this.state.error = (this.failure ?? error).message;
         for (const task of this.state.tasks) if (task.status === 'pending') task.status = 'blocked';
         await this.save(); await this.release();
         await this.progress?.finish(this.state.error);
@@ -118,27 +161,33 @@ export class DagRun {
   async cancel() {
     if (this.state.status !== 'running') return;
     this.controller.abort(new Error('用户取消 DAG 运行'));
-    await this.progress?.update('已请求取消，正在停止当前 Agent；已合入的提交会保留');
+    await this.progress?.update('已请求取消，正在停止所有活动 Agent；已合入的提交会保留');
   }
-  async step(context) {
-    if (this.busy) throw new Error('节点必须串行执行，请等待当前节点结束');
-    if (this.state.status !== 'running') return this.state;
-    const task = this.state.tasks.find(t => t.status === 'pending' && t.dependencies.every(id => this.state.tasks.find(t => t.id === id).status === 'done'));
-    if (!task) {
-      this.state.status = this.state.tasks.every(t => t.status === 'done') ? 'done' : 'blocked';
-      await this.save(); await this.release(); await this.progress?.finish(this.state.status === 'done' ? '所有节点已完成并合并到主分支' : '没有可执行节点，DAG 已阻塞'); return this.state;
-    }
-    this.busy = true;
-    let stop;
+  ready() {
+    return this.state.tasks.filter(task => task.status === 'pending' && task.dependencies.every(id =>
+      this.state.tasks.find(item => item.id === id).status === 'done' && !this.active.has(id)));
+  }
+  async complete() {
+    if (this.active.size) throw new Error('仍有活动 Agent，不能结束 DAG');
+    this.state.status = this.state.tasks.every(task => task.status === 'done') ? 'done' : 'blocked';
+    await this.save(); await this.release();
+    await this.progress?.finish(this.state.status === 'done' ? '所有节点已完成并合并到主分支' : '没有可执行节点，DAG 已阻塞');
+    return this.state;
+  }
+  async runTask(task, context) {
+    let stop, stopping;
     try {
       context.abort.throwIfAborted();
       await this.progress?.update(`节点 ${task.id} · 正在创建 worktree 和子会话`);
-      await this.assertLocal();
-      task.baseCommit = await git(this.root, ['rev-parse', 'HEAD']);
-      task.branch = `dag/${this.state.id}/task-${task.id}`;
-      task.worktree = join(dirname(this.root), '.dag-worktrees', basename(this.root), this.state.id, `task-${task.id}`);
-      await mkdir(dirname(task.worktree), { recursive: true });
-      await git(this.root, ['worktree', 'add', '-b', task.branch, task.worktree, task.baseCommit]);
+      await this.integrate(async () => {
+        context.abort.throwIfAborted();
+        await this.assertLocal();
+        task.baseCommit = this.state.syncedCommit;
+        task.branch = `dag/${this.state.id}/task-${task.id}`;
+        task.worktree = join(dirname(this.root), '.dag-worktrees', basename(this.root), this.state.id, `task-${task.id}`);
+        await mkdir(dirname(task.worktree), { recursive: true });
+        await git(this.root, ['worktree', 'add', '-b', task.branch, task.worktree, task.baseCommit]);
+      });
       context.abort.throwIfAborted();
       const source = task.dependencies.length === 1 ? this.state.tasks.find(t => t.id === task.dependencies[0]) : undefined;
       const workspace = unwrap(await this.client._client.post({ url: '/experimental/workspace', query: { directory: this.root },
@@ -156,49 +205,58 @@ export class DagRun {
       registry.workers.set(session.id, { run: this, task }); await this.save();
       await this.progress?.update(`节点 ${task.id} · Agent 正在执行任务`, session.id);
       context.metadata({ title: `任务 ${task.id}: ${task.title}`, metadata: { sessionId: session.id, worktree: task.worktree, taskId: task.id } });
-      stop = () => { void this.client.session.abort({ path: { id: session.id }, query, headers }).catch(() => {}); };
+      stop = () => { stopping = this.client.session.abort({ path: { id: session.id }, query, headers }).catch(() => {}); };
       context.abort.addEventListener('abort', stop, { once: true }); context.abort.throwIfAborted();
       const prompt = taskInput(task, this.state.tasks.filter(t => task.dependencies.includes(t.id)), Boolean(source));
       const result = unwrap(await this.client.session.prompt({ path: { id: session.id }, query, headers,
         body: { agent: 'dag-worker', parts: [{ type: 'text', text: prompt }] }, signal: context.abort }));
       task.report = result.parts?.filter(p => p.type === 'text').map(p => p.text).join('\n') ?? '';
       if (task.status !== 'done') throw new Error('节点会话已结束，但 submit_task 尚未完成 PR 合并');
+      task.finishedAt = Date.now();
       await this.save(); await this.progress?.update(`节点 ${task.id} 已完成并合并 PR #${task.pr}`);
       return { id: task.id, status: task.status, pr: task.pr, session: task.session, report: task.report };
     } catch (error) {
       const status = context.abort.aborted ? 'cancelled' : 'failed';
       if (task.status !== 'done') task.status = status;
-      task.error = error.message;
-      this.state.status = status; this.state.error = error.message;
-      for (const item of this.state.tasks) if (item.status === 'pending') item.status = 'blocked';
-      await this.save(); await this.release(); await this.progress?.finish(`节点 ${task.id} ${task.status}：${error.message}`); throw error;
-    } finally { if (stop) context.abort.removeEventListener('abort', stop); this.busy = false; }
+      task.error = error.message; task.finishedAt = Date.now();
+      if (!this.controller.signal.aborted) {this.failure = error; this.controller.abort(error);}
+      await this.save(); throw error;
+    } finally {
+      if (stop) context.abort.removeEventListener('abort', stop);
+      if (stopping) await stopping;
+    }
   }
   async submit(task, summary) {
     if (task.submitting) return { status: 'blocked', message: '已有提交正在处理，请勿并发调用' };
     if (task.status === 'done') return { status: 'merged', pr: task.pr };
     task.submitting = true;
     try {
-      await this.progress?.update(`节点 ${task.id} · 检查提交并推送任务分支`);
-      await this.assertLocal();
-      await clean(task.worktree);
-      if (await git(task.worktree, ['branch', '--show-current']) !== task.branch) throw new Error('任务分支被切换，拒绝提交');
-      const head = await git(task.worktree, ['rev-parse', 'HEAD']);
-      if (head === task.baseCommit) throw new Error('请先完成代码并 git commit，再调用 submit_task');
-      await git(task.worktree, ['push', '-u', this.state.gitRemote, `HEAD:refs/heads/${task.branch}`]);
-      await this.assertLocal();
-      const result = await this.provider.submit(task, this.state.integrationBranch, summary, head);
-      if (result.status === 'conflict') {
-        result.repairCommands = [
-          ['fetch', '--no-tags', this.state.gitRemote, `refs/heads/${this.state.integrationBranch}:${this.state.integrationRef}`],
-          ['merge', this.state.integrationRef, '--no-edit']
-        ];
-        result.action = '用 git 工具逐条执行 repairCommands 的参数数组，解决冲突、测试、git commit 后再调用 submit_task，复用本次 PR。';
-      }
-      task.lastSubmission = result; task.commit = head;
-      await this.save();
-      if (result.status === 'merged') { await this.sync(result.mergeCommit); task.status = 'done'; task.mergeCommit = result.mergeCommit; }
-      await this.save(); await this.progress?.update(`节点 ${task.id} · PR ${result.pr ?? ''} · ${result.status}${result.message ? ': ' + result.message : ''}`); return result;
+      return await this.integrate(async () => {
+        this.controller.signal.throwIfAborted();
+        if (this.state.status !== 'running') throw new Error('DAG 已结束，不能提交新 PR');
+        await this.progress?.update(`节点 ${task.id} · 检查提交并推送任务分支`);
+        await this.assertLocal();
+        await clean(task.worktree);
+        if (await git(task.worktree, ['branch', '--show-current']) !== task.branch) throw new Error('任务分支被切换，拒绝提交');
+        const head = await git(task.worktree, ['rev-parse', 'HEAD']);
+        if (head === task.baseCommit) throw new Error('请先完成代码并 git commit，再调用 submit_task');
+        await git(task.worktree, ['push', '-u', this.state.gitRemote, `HEAD:refs/heads/${task.branch}`]);
+        this.controller.signal.throwIfAborted();
+        await this.assertLocal();
+        const result = await this.provider.submit(task, this.state.integrationBranch, summary, head);
+        if (result.status === 'conflict') {
+          const repairRef = `refs/dag/${this.state.id}/task-${task.id}/integration`;
+          result.repairCommands = [
+            ['fetch', '--no-tags', this.state.gitRemote, `refs/heads/${this.state.integrationBranch}:${repairRef}`],
+            ['merge', repairRef, '--no-edit']
+          ];
+          result.action = '用 git 工具逐条执行 repairCommands 的参数数组，解决冲突、测试、git commit 后再调用 submit_task，复用本次 PR。';
+        }
+        task.lastSubmission = result; task.commit = head;
+        await this.save();
+        if (result.status === 'merged') { await this.sync(result.mergeCommit); task.status = 'done'; task.mergeCommit = result.mergeCommit; }
+        await this.save(); await this.progress?.update(`节点 ${task.id} · PR ${result.pr ?? ''} · ${result.status}${result.message ? ': ' + result.message : ''}`); return result;
+      });
     } catch (error) { await this.progress?.update(`节点 ${task.id} · 提交受阻：${error.message}`); return { status: 'blocked', message: error.message }; }
     finally { task.submitting = false; }
   }
