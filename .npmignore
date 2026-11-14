@@ -1,0 +1,11 @@
+.git/
+.dag/
+.test-tmp/
+.opencode/
+node_modules/
+.npmrc
+.env
+.env.*
+test/
+scripts/
+*.tgz

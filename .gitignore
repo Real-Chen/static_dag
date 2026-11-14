@@ -1,0 +1,8 @@
+.dag/
+.test-tmp/
+node_modules/
+.npmrc
+.env
+.env.*
+*.tgz
+vendor/gitea/windows-x64/gitea.exe

@@ -1,0 +1,8 @@
+{
+  "baseBranch": "main",
+  "gitea": {
+    "url": "https://gitea.example.com",
+    "owner": "your-owner",
+    "repoPrefix": "your-project"
+  }
+}

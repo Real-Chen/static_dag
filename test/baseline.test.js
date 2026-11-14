@@ -1,0 +1,77 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, relative, isAbsolute } from 'node:path';
+import { DagRun } from '../src/dag_run/index.js';
+import { git } from '../src/dag_run/git.js';
+
+test('本轮集成分支尊重本地回退，只同步确认的PR提交，保护运行中的本地修改', async t => {
+  const fixture = await mkdtemp(join(tmpdir(), 'dag-baseline-'));
+  const repo = join(fixture, 'repo'), remote = join(fixture, 'remote.git'), runRemote = join(fixture, 'run.git'), merger = join(fixture, 'merger');
+  let run;
+  const old = {token: process.env.GITEA_TOKEN, workspaces: process.env.OPENCODE_EXPERIMENTAL_WORKSPACES};
+  t.after(async () => {
+    await run?.release();
+    for (const [key, value] of [['GITEA_TOKEN', old.token], ['OPENCODE_EXPERIMENTAL_WORKSPACES', old.workspaces]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    const path = relative(tmpdir(), fixture);
+    if (!path || path.startsWith('..') || isAbsolute(path)) throw new Error('测试清理路径越界');
+    await rm(fixture, {recursive: true, force: true});
+  });
+  process.env.GITEA_TOKEN = 'fixture'; process.env.OPENCODE_EXPERIMENTAL_WORKSPACES = 'true';
+  await mkdir(repo); await git(repo, ['init', '-q', '-b', 'main']);
+  await git(repo, ['config', 'user.name', 'Baseline test']); await git(repo, ['config', 'user.email', 'baseline@example.invalid']);
+  await writeFile(join(repo, '.gitignore'), '.dag/\n'); await writeFile(join(repo, 'base.txt'), 'base\n');
+  await git(repo, ['add', '.']); await git(repo, ['commit', '-qm', 'baseline']);
+  const baseline = await git(repo, ['rev-parse', 'HEAD']);
+  await git(repo, ['clone', '--bare', repo, remote]); await git(repo, ['remote', 'add', 'origin', remote]);
+  await writeFile(join(repo, 'old-remote.txt'), 'old remote main\n');
+  await git(repo, ['add', '.']); await git(repo, ['commit', '-qm', 'remote main changes']);
+  const oldRemoteMain = await git(repo, ['rev-parse', 'HEAD']);
+  await git(repo, ['push', 'origin', 'main']); await git(repo, ['reset', '--hard', baseline]);
+  await mkdir(join(repo, '.dag'));
+  await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({tasks: [{id: 1, title: 'Task', description: 'Task', testStrategy: 'Verify files', dependencies: []}]}));
+  await writeFile(join(repo, '.dag/runner.json'), JSON.stringify({baseBranch: 'main', remote: 'origin', gitea: {url: 'http://127.0.0.1:9', owner: 'test', repo: 'fixture'}}));
+  run = await DagRun.start(repo, 'baseline-fixture', {});
+  run.provider.createRunRepository = async state => {
+    await git(repo, ['init', '--bare', runRemote]);
+    return {...state.gitea, cloneUrl: runRemote};
+  };
+  await run.initializeIntegration();
+  assert.equal(run.state.initialCommit, baseline);
+  assert.equal(await git(repo, ['rev-parse', 'HEAD']), baseline);
+  assert.equal(await git(remote, ['rev-parse', 'refs/heads/main']), oldRemoteMain);
+  assert.equal(await git(runRemote, ['rev-parse', `refs/heads/${run.state.integrationBranch}`]), baseline);
+  assert.equal(await git(repo, ['remote', 'get-url', 'origin']), remote);
+  await git(repo, ['clone', runRemote, merger]);
+  await git(merger, ['config', 'user.name', 'PR merger']); await git(merger, ['config', 'user.email', 'merger@example.invalid']);
+  await git(merger, ['checkout', '-b', 'run-integration', `origin/${run.state.integrationBranch}`]);
+  await writeFile(join(merger, 'accepted.txt'), 'confirmed PR result\n');
+  await git(merger, ['add', '.']); await git(merger, ['commit', '-qm', 'confirmed PR merge']);
+  const confirmed = await git(merger, ['rev-parse', 'HEAD']);
+  await writeFile(join(merger, 'later.txt'), 'not part of confirmed merge\n');
+  await git(merger, ['add', '.']); await git(merger, ['commit', '-qm', 'later unrelated update']);
+  await git(merger, ['push', 'origin', `HEAD:refs/heads/${run.state.integrationBranch}`]);
+  await run.sync(confirmed);
+  assert.equal(await git(repo, ['rev-parse', 'HEAD']), confirmed);
+  assert.equal(run.state.syncedCommit, confirmed);
+  assert.equal((await readFile(join(repo, 'accepted.txt'), 'utf8')).trim(), 'confirmed PR result');
+  await assert.rejects(readFile(join(repo, 'later.txt')), {code: 'ENOENT'});
+  await assert.rejects(readFile(join(repo, 'old-remote.txt')), {code: 'ENOENT'});
+  await assert.rejects(run.sync(), /有效合并提交/);
+  await assert.rejects(run.sync(oldRemoteMain), /不属于本轮/);
+  await writeFile(join(repo, 'base.txt'), 'user editing\n');
+  await assert.rejects(run.sync(confirmed), /被修改/);
+  assert.equal(await readFile(join(repo, 'base.txt'), 'utf8'), 'user editing\n');
+  await git(repo, ['restore', 'base.txt']); await git(repo, ['checkout', '-b', 'user-branch']);
+  await assert.rejects(run.sync(confirmed), /目标分支已变化/);
+  assert.equal(await git(repo, ['branch', '--show-current']), 'user-branch');
+  await git(repo, ['checkout', 'main']); await git(repo, ['reset', '--hard', baseline]);
+  await assert.rejects(run.sync(confirmed), /HEAD 已被外部移动/);
+  assert.equal(await git(repo, ['rev-parse', 'HEAD']), baseline);
+  await git(repo, ['reset', '--hard', confirmed]);
+  await assert.rejects(run.initializeIntegration(), /仓库已存在/);
+  assert.equal(await git(remote, ['rev-parse', 'refs/heads/main']), oldRemoteMain);
+});

@@ -1,0 +1,8 @@
+{
+  "version": "28.3.0",
+  "platform": "win32",
+  "arch": "x64",
+  "file": "windows-x64/gitea.exe",
+  "sha256": "4003c068ef0a7d8145ef8c85b8aab052bf1bbf9226f2d0058572f013e096ee06",
+  "source": "https://dl.gitea.com/gitea/28.3.0/gitea-28.3.0-windows-amd64.exe"
+}

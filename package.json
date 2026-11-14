@@ -1,0 +1,53 @@
+{
+  "name": "deveco-dag",
+  "version": "0.4.1",
+  "description": "DAG planning and worktree agents with bundled local Gitea for OpenCode 1.19.5 on Windows x64",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/plugin.js",
+  "exports": {
+    ".": "./src/plugin.js",
+    "./server": "./src/plugin.js",
+    "./tui": "./dist/tui.js"
+  },
+  "bin": {
+    "deveco-dag": "./bin/cli.js"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "src/",
+    "prompts/",
+    "dist/",
+    "vendor/gitea/",
+    "bin/",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "test": "node --test test/*.test.js",
+    "test:integration": "node test/integration.mjs",
+    "test:run": "node test/run-integration.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.19.5"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.13",
+    "babel-preset-solid": "^1.9.19"
+  }
+}
