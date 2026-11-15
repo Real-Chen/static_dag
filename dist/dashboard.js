@@ -225,16 +225,19 @@ export function Dashboard(props) {
         _$setProp(_el$45, "truncate", true);
         _$insert(_el$45, () => task.title);
         _$setProp(_el$46, "width", 10);
-        _$insert(_el$46, () => labels[task.status] ?? task.status);
+        _$insert(_el$46, (() => {
+          var _c$ = _$memo(() => !!task.retry?.waiting);
+          return () => _c$() ? '等待重试' : labels[task.status] ?? task.status;
+        })());
         _$setProp(_el$47, "width", 12);
         _$insert(_el$47, (() => {
-          var _c$ = _$memo(() => !!task.dependencies.length);
-          return () => _c$() ? task.dependencies.join(', ') : '—';
+          var _c$2 = _$memo(() => !!task.dependencies.length);
+          return () => _c$2() ? task.dependencies.join(', ') : '—';
         })());
         _$setProp(_el$48, "width", 8);
         _$insert(_el$48, (() => {
-          var _c$2 = _$memo(() => !!task.pr);
-          return () => _c$2() ? '#' + task.pr : '—';
+          var _c$3 = _$memo(() => !!task.pr);
+          return () => _c$3() ? '#' + task.pr : '—';
         })());
         _$effect(_p$ => {
           var _v$17 = index() === selected() ? theme().backgroundElement : theme().background,

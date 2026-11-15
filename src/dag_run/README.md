@@ -36,13 +36,15 @@ OpenCode 1.19.5 的 Fork 路由优先绑定源会话 Workspace，单独指定新
 
 任务开发并发，但 worktree 基线创建与 submit_task 的 push/PR 合并/主工作区同步共用串行集成队列，避免 HEAD 校验和 Git 引用互相干扰。状态快照也按调用顺序写入。各 Agent 解决冲突时使用自己的修复引用，不争用主工作区的跟踪引用。取消或任一节点失败时，停止所有活动 Agent，等待已开始的集成操作收尾后再释放运行锁，未执行节点标为 blocked；已确认合并的提交保留。
 
+429 不进入上述整轮失败路径：保留 OpenCode 原生重试，其耗尽后由框架在同一个 session/worktree 继续。优先遵循 retry-after-ms、Retry-After 秒数或 HTTP 日期，无有效头时指数退避并抖动（2 秒起、最长 60 秒），不限制 429 重试次数，等待支持立即取消。重试只追加 ignored/synthetic 继续标记，不重复发送任务说明或创建 worktree；已完成工具结果留在原会话。等待次数与时间保存在任务 retry 字段，看板显示等待重试。相同 DAG 的新模型请求共享冷却期；runner.json 可用正整数 modelRequestsPerMinute 限制该轮总请求速率，不配置时不假设各服务的额度。此节流作用于本服务器这轮 DAG，不涵盖其他程序或其他服务器对同一个 API Key 的调用。
+
 worker 可使用原生文件工具、bash 和额外 git 工具。在开发、测试并 git add/commit 后调用 `submit_task({summary})`；工具检查工作区干净、分支正确、有新 commit，然后 push、创建/复用 PR、请求合并并重新查询确认。只有启动 worktree 成功同步本轮 PR 的确切合并提交后才 done。测试由 Agent 执行报告，本版无独立强制机器验收器。开发输入使用 task.md 的可读模板，只传当前任务的标题、目标、实施说明、验收要求和一份工作目录。session、workspaceID、分支、提交、Gitea URL、remote 等运行状态保留在框架内。单依赖 Fork 不重复拼接前置报告；多依赖新会话仅附直接前置任务的报告。
 
 HTTP 409 冲突作为 submit_task 的 JSON 结果返回原 Agent，同时在 repairCommands 中提供本轮正确的 fetch/merge 参数数组，按需传递修复目标。Agent 逐条调用 git 工具、处理冲突、重新测试和 commit，再调用同一个工具重试同一个 PR。其他权限/CI/审核问题返回 blocked，不强制合并。会话结束而未成功合并时运行失败，未执行节点 blocked。下一节点必须等待当前会话结束、PR 已合入、主工作区同步完成。
 
 独立 DAG 页面使用公开 route 插件接口和 OpenTUI/Solid 渲染，不使用搜索弹窗，没有聊天背景。页面显示完成数、固定/实时耗时、进度条和任务表格；每个任务一行，状态/依赖/PR 分列。鼠标点击或方向键加 Enter 进入该节点的原生会话。未启动的节点不可进入。`/dag_panel` 重新打开页面，`/dag_status` 刷新服务器状态，`/dag_cancel` 请求停止当前 Agent 并阻止后续节点。页内 r 刷新、c 取消（仅运行中有效）、Esc 返回主会话。DAG 任务详情中按 ↑ 或点击底部「返回 DAG 看板」直接返回所属运行批次并选中原任务，不再先返回父会话；普通会话不改动，弹窗打开时保持原生按键行为。Ctrl+p 选择「DAG 任务面板」仍可作为备用入口。取消不回滚已合入提交，离开页面不会取消后台运行。单依赖 Fork 可能以独立会话显示，不修改数据库伪造 parentID。
 
-通过 `opencode plugin --global deveco-dag@0.5.0 --force` 安装时，会根据 npm 包的 ./server 和 ./tui 入口注册服务端与 TUI。在全局 opencode.json(c) 和 tui.json 的 plugin 数组中使用 `deveco-dag@0.5.0`；不需要源码路径或 plugins 目录下的本地 shim。本项目不再提供自动加载源码的项目入口，开发验证通过测试配置显式加载。没有修改 OpenCode 本体。
+通过 `opencode plugin --global deveco-dag@0.5.1 --force` 安装时，会根据 npm 包的 ./server 和 ./tui 入口注册服务端与 TUI。在全局 opencode.json(c) 和 tui.json 的 plugin 数组中使用 `deveco-dag@0.5.1`；不需要源码路径或 plugins 目录下的本地 shim。本项目不再提供自动加载源码的项目入口，开发验证通过测试配置显式加载。没有修改 OpenCode 本体。
 
 主聊天不显示控制或进度状态块，运行信息统一在独立页面。页面按 session 和运行批次关联主 DAG，进入 Fork 会话后仍能返回。完成后不再显示取消提示，耗时停止更新；兼容旧版进度记录的耗时。OpenCode 原生 Fork 会保留历史 session.directory，子会话的宿主路径提示可能显示来源路径；实际工具目录经 Workspace ID 和 git 工具上下文校验，任务消息中的 currentWorktree 为真实执行目录。
 

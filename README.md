@@ -59,12 +59,15 @@ npx deveco-dag status
 ```json
 {
   "maxConcurrency": 20,
+  "modelRequestsPerMinute": 12,
   "baseBranch": "main",
   "gitea": {"repoPrefix": "my-project"}
 }
 ```
 
 maxConcurrency 是正整数，默认为 20；设为 1 时串行执行。也兼容通过 gitea.url、owner、repoPrefix 指定已有外部 Gitea，此时使用原生 Git 凭据和 GITEA_TOKEN/credential helper。旧 gitea.repo 字段仍可作为命名前缀。详见 src/dag_run/README.md。
+
+modelRequestsPerMinute 可选，限制本轮 DAG 所有节点的模型调用速率，与节点并发数分别控制。示例 12 适用于 16 RPM 服务预留余量；不配置时不预设服务额度。OpenCode 原生重试结束后若仍返回 429，框架遵循 Retry-After（秒/HTTP 日期）或 retry-after-ms，在原 session/worktree 中持续重试并共享冷却期，不因 429 取消其他节点。没有重试次数耗尽后自动结束整轮的规则；可用 /dag_cancel 停止等待。看板显示“等待重试”。权限、鉴权和业务错误仍按失败处理。
 
 ## 开发
 

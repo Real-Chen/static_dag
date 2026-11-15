@@ -29,6 +29,16 @@ export function runnerHooks({ client, root, experimental_workspace }) {
         return git(worker.task.worktree, args.args, context.abort);
       } })
     },
+    async params(input) {
+      const worker = registry.workers.get(input.sessionID);
+      if (!worker || worker.run.state.status !== 'running') return;
+      await worker.run.modelGate.acquire(worker.run.controller.signal);
+      if (worker.task.retry?.waiting) {
+        worker.task.retry.waiting = false;
+        await worker.run.save();
+        await worker.run.progress?.update(`节点 ${worker.task.id} · 继续原 Agent 会话`, input.sessionID);
+      }
+    },
     async control(input) {
       const existing = registry.runs.get(input.sessionID);
       const active = registry.roots.get(root);

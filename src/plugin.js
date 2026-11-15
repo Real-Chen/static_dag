@@ -88,6 +88,7 @@ export default async function DagPlugin({ client, directory, worktree, serverUrl
       active.delete(sessionID);
       if (!run.saved && event.type === 'session.idle') await toast('本轮未成功写入有效 DAG，请查看 Agent 输出；旧文件不代表本轮完成。', 'warning');
     },
+    'chat.params': input => runner.params(input),
     tool: runner.tool,
     dispose: async () => { active.clear(); await runner.dispose(); if (loaded.get(key) === hooks) loaded.delete(key); }
   };

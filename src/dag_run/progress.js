@@ -27,8 +27,8 @@ export class Progress {
       gitea: this.run?.state.gitea,
       maxConcurrency: this.run?.state.maxConcurrency,
       detail: this.detail, directory: this.run?.dir, startedAt: this.started, updatedAt: Date.now(),
-      tasks: (this.run?.state.tasks ?? []).map(({ id, title, status, dependencies, session, workspaceID, pr, error }) =>
-        ({ id, title, status, dependencies, session, workspaceID, pr, error })) };
+      tasks: (this.run?.state.tasks ?? []).map(({ id, title, status, dependencies, session, workspaceID, pr, error, retry }) =>
+        ({ id, title, status, dependencies, session, workspaceID, pr, error, retry })) };
   }
   async toast(message, variant = 'info') {
     try { await this.client.tui.showToast({ body: { title: 'DAG', message, variant }, signal: AbortSignal.timeout(3000) }); } catch { /* Headless hosts may have no TUI. */ }

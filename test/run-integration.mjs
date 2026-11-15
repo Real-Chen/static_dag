@@ -65,8 +65,11 @@ await new Promise(r => provider.listen(0, '127.0.0.1', r));
 const tasks = [[], [1], [1], [2, 3]].map((dependencies, i) => ({ id: i + 1, title: `fixture-${i + 1}`, description: '开发测试文件', details: '按任务写文件并提交', testStrategy: '文件内容核对', dependencies }));
 await mkdir(join(repo, '.dag'));
 await writeFile(join(repo, '.dag/dag.json'), JSON.stringify({ tasks }));
-await writeFile(join(repo, '.dag/runner.json'), JSON.stringify({ remote: 'origin', baseBranch: 'main', gitea: { url: `http://127.0.0.1:${provider.address().port}`, owner: 'test', repo: 'fixture' } }));
+await writeFile(join(repo, '.dag/runner.json'), JSON.stringify({ remote: 'origin', baseBranch: 'main', modelRequestsPerMinute: 600, gitea: { url: `http://127.0.0.1:${provider.address().port}`, owner: 'test', repo: 'fixture' } }));
 const steps = new Map(), workerDirectories = new Map(), repairs = new Map(); let failure, completed = false, requestCount = 0;
+const testRateLimit = process.env.DAG_TEST_RATE_LIMIT === '1';
+let limitedRequests = 0, recoveredRateLimit = false;
+const workerRequestTimes = [];
 const progressSnapshots = [];
 let holdWorker = false;
 const heldWorkers = new Set(), stoppedWorkers = new Set(), parallelWorkers = new Set();
@@ -85,7 +88,9 @@ const model = http.createServer(async (req, res) => {
     requestCount++; if (requestCount > 65) throw new Error('测试模型检测到异常循环');
     assert.ok(!names.includes('dag_next'), '模型不应看到 dag_next 工具');
     if (!names.includes('submit_task')) return reply(res, { content: 'DAG runner test' });
-    const input = parseWorkerInput(text(body.messages.findLast(m => m.role === 'user').content)), id = input.id, cwd = input.worktree;
+    workerRequestTimes.push(Date.now());
+    const originalTask = body.messages.filter(m => m.role === 'user').map(m => text(m.content)).findLast(content => /^任务 \d+：/m.test(content));
+    const input = parseWorkerInput(originalTask), id = input.id, cwd = input.worktree;
     if (holdWorker) {
       heldWorkers.add(id);
       await new Promise(resolve => res.once('close', resolve));
@@ -100,6 +105,17 @@ const model = http.createServer(async (req, res) => {
     if (!workerDirectories.has(id)) await assert.rejects(readFile(join(cwd, 'remote-only.txt')), {code: 'ENOENT'});
     workerDirectories.set(id, cwd);
     const file = join(cwd, id === 2 ? 'shared.txt' : `node-${id}.txt`);
+    if (testRateLimit && id === 2 && steps.get(id) === 2 && !recoveredRateLimit) {
+      const [runId] = await readdir(join(repo, '.dag/runs'));
+      const current = JSON.parse(await readFile(join(repo, '.dag/runs', runId, 'state.json'), 'utf8'));
+      if (!current.tasks[1].retry?.attempt) {
+        limitedRequests++;
+        res.writeHead(429, {'content-type': 'application/json', 'retry-after-ms': '1'});
+        res.end(JSON.stringify({error: {message: 'Fixture rate limit', type: 'rate_limit_error'}}));
+        return;
+      }
+      recoveredRateLimit = true;
+    }
     const n = steps.get(id) ?? 0; steps.set(id, n + 1);
     if (n === 4 && id === 2) {
       const result = JSON.parse(text(body.messages.at(-1).content));
@@ -180,6 +196,18 @@ try {
   assert.ok(actualConflict); assert.equal(prCount, 4); assert.equal(workerDirectories.size, 4);
   assert.equal(state.initialCommit, initialCommit);
   assert.equal(state.maxConcurrency, 20);
+  if (testRateLimit) {
+    assert.ok(limitedRequests >= 1); assert.ok(recoveredRateLimit);
+    assert.ok(state.tasks[1].retry.attempt >= 1);
+    const history = await api(`/session/${state.tasks[1].session}/message`);
+    assert.equal(history.flatMap(message => message.parts).filter(part => part.type === 'tool' && part.tool === 'write' &&
+      part.state.input?.filePath?.replaceAll('\\', '/').endsWith('/shared.txt')).length, 2,
+      '首次开发与冲突修复各写一次，429 不能从头重复工具');
+    assert.ok(progressSnapshots.some(text => /限流 429/.test(text)));
+    assert.ok(workerRequestTimes.slice(1).every((time, index) => time - workerRequestTimes[index] >= 80),
+      '原生模型调用也必须经过共享 RPM 队列（测试设置每 100ms 一次）');
+    console.log(JSON.stringify({rateLimitRecovered: true, sameSessionAndWorktree: true, noRepeatedDevelopment: true, siblingsCompleted: true, limitedRequests}));
+  }
   assert.equal(state.localBranch, 'main');
   assert.equal(state.integrationBranch, `dag/${runId}/integration`);
   const firstRepository = repositories.get(state.gitea.repo);

@@ -66,7 +66,7 @@ export function Dashboard(props) {
           onMouseUp={() => {setSelected(index()); props.open(task);}}>
           <text width={4} fg={theme().textMuted}>{task.id}</text>
           <text flexGrow={1} flexShrink={1} fg={theme().text} truncate>{task.title}</text>
-          <text width={10} fg={color(task.status)}>{labels[task.status] ?? task.status}</text>
+          <text width={10} fg={color(task.status)}>{task.retry?.waiting ? '等待重试' : labels[task.status] ?? task.status}</text>
           <text width={12} fg={theme().textMuted}>{task.dependencies.length ? task.dependencies.join(', ') : '—'}</text>
           <text width={8} fg={task.pr ? theme().primary : theme().textMuted}>{task.pr ? '#' + task.pr : '—'}</text>
         </box>

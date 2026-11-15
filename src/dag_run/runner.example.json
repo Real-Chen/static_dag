@@ -1,5 +1,6 @@
 {
   "maxConcurrency": 20,
+  "modelRequestsPerMinute": 12,
   "baseBranch": "main",
   "gitea": {
     "url": "https://gitea.example.com",

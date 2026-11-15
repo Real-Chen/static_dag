@@ -8,15 +8,17 @@ import { Gitea } from './gitea.js';
 import { resolveGiteaToken } from './credentials.js';
 import { loadRunnerConfig, enableWorkspaces } from '../runtime/local-gitea.js';
 import { taskInput } from './input.js';
+import { ModelGate, rateLimit, retryDelay } from './rate-limit.js';
 
 export const registry = globalThis[Symbol.for('static-dag.execution')] ??= { runs: new Map(), workers: new Map(), roots: new Map() };
 export const DEFAULT_MAX_CONCURRENCY = 20;
-const unwrap = value => { if (value.error || !value.data || value.data.info?.error) throw new Error(JSON.stringify(value.error ?? value.data?.info?.error ?? '宿主返回空结果')); return value.data; };
+const unwrap = value => { const error = value.error ?? value.data?.info?.error; if (error || !value.data) throw new Error(JSON.stringify(error ?? '宿主返回空结果'), {cause: error}); return value.data; };
 export class DagRun {
   constructor() {
     this.active = new Map();
     this.integrationTail = Promise.resolve();
     this.saveTail = Promise.resolve();
+    this.modelGate = new ModelGate();
   }
   integrate(operation) {
     const next = this.integrationTail.then(operation);
@@ -37,6 +39,7 @@ export class DagRun {
     const {config, token} = await loadRunnerConfig(root);
     config.maxConcurrency ??= DEFAULT_MAX_CONCURRENCY;
     if (!Number.isSafeInteger(config.maxConcurrency) || config.maxConcurrency < 1) throw new Error('maxConcurrency 必须为正整数');
+    if (config.modelRequestsPerMinute !== undefined && (!Number.isSafeInteger(config.modelRequestsPerMinute) || config.modelRequestsPerMinute < 1)) throw new Error('modelRequestsPerMinute 必须为正整数');
     config.baseBranch ??= branch;
     if (branch !== config.baseBranch) throw new Error('请在目标主 worktree 的 baseBranch 分支执行 /dag_run');
     const provider = new Gitea(config.gitea, token ?? await resolveGiteaToken(root, config.gitea));
@@ -47,6 +50,7 @@ export class DagRun {
         syncedCommit: initialCommit, maxConcurrency: config.maxConcurrency, tasks: dag.tasks.map(t => ({ ...t, status: 'pending' })) }, controller: new AbortController() });
     // Each active worker and its HTTP request observes this per-run signal.
     setMaxListeners(0, run.controller.signal);
+    run.modelGate = new ModelGate(config.modelRequestsPerMinute);
     run.state.integrationBranch = `dag/${run.state.id}/integration`;
     run.state.gitRemote = `dag-run-${run.state.id}`;
     run.state.integrationRef = `refs/remotes/${run.state.gitRemote}/${run.state.integrationBranch}`;
@@ -174,6 +178,31 @@ export class DagRun {
     await this.progress?.finish(this.state.status === 'done' ? '所有节点已完成并合并到主分支' : '没有可执行节点，DAG 已阻塞');
     return this.state;
   }
+  async promptTask(task, query, headers, prompt, signal) {
+    let first = true;
+    for (;;) {
+      signal.throwIfAborted();
+      try {
+        const parts = first ? [{type: 'text', text: prompt}] : [{type: 'text', text: '继续当前节点',
+          synthetic: true, ignored: true, metadata: {dagRetry: true}}];
+        first = false;
+        const result = unwrap(await this.client.session.prompt({path: {id: task.session}, query, headers,
+          body: {agent: 'dag-worker', parts}, signal}));
+        if (task.retry) task.retry.waiting = false;
+        return result;
+      } catch (error) {
+        const limited = rateLimit(error);
+        if (!limited || signal.aborted) throw error;
+        const attempt = (task.retry?.attempt ?? 0) + 1;
+        const delayMs = retryDelay(limited.headers, attempt);
+        task.retry = {attempt, waiting: true, statusCode: 429, nextRetryAt: Date.now() + delayMs};
+        this.modelGate.deferUntil(task.retry.nextRetryAt);
+        await this.save();
+        await this.progress?.update(`节点 ${task.id} · 模型限流 429，等待至少 ${Math.ceil(delayMs / 1000)} 秒后在原会话重试（第 ${attempt} 次）`, task.session);
+        await this.modelGate.wait(signal);
+      }
+    }
+  }
   async runTask(task, context) {
     let stop, stopping;
     try {
@@ -208,8 +237,8 @@ export class DagRun {
       stop = () => { stopping = this.client.session.abort({ path: { id: session.id }, query, headers }).catch(() => {}); };
       context.abort.addEventListener('abort', stop, { once: true }); context.abort.throwIfAborted();
       const prompt = taskInput(task, this.state.tasks.filter(t => task.dependencies.includes(t.id)), Boolean(source));
-      const result = unwrap(await this.client.session.prompt({ path: { id: session.id }, query, headers,
-        body: { agent: 'dag-worker', parts: [{ type: 'text', text: prompt }] }, signal: context.abort }));
+      const result = await this.promptTask(task, query, headers, prompt, context.abort);
+      if (task.retry) task.retry.waiting = false;
       task.report = result.parts?.filter(p => p.type === 'text').map(p => p.text).join('\n') ?? '';
       if (task.status !== 'done') throw new Error('节点会话已结束，但 submit_task 尚未完成 PR 合并');
       task.finishedAt = Date.now();

@@ -1,6 +1,6 @@
 export const labels = { pending: '待执行', running: '执行中', done: '已完成', blocked: '阻塞', failed: '失败', cancelled: '已取消', paused: '已停止' };
 export function isDagTransportPart(part) {
-  return part?.type === 'text' && (part.metadata?.dagProgress === true ||
+  return part?.type === 'text' && (part.metadata?.dagProgress === true || part.metadata?.dagRetry === true ||
     (['start', 'status', 'cancel'].includes(part.metadata?.dagControl?.action) && typeof part.metadata.dagControl.root === 'string'));
 }
 export function viewFromPart(part) {
