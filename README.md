@@ -17,12 +17,36 @@ opencode plugin --global deveco-dag
 
 安装命令会根据包内 `./server` 和 `./tui` 入口注册两部分，重启 OpenCode 加载。Gitea 可执行文件已包含在 npm 包中，不在运行时联网下载，不需要 Docker 或管理员权限。
 
-OpenCode 1.19.5 的 Workspace 开关在启动时读取。插件会自动为当前 Windows 用户保存开关；首次启用后，关闭并重新打开终端应用，再启动 OpenCode。也可在启动终端中设置：
+### 启用 Workspace（运行 DAG 必需）
+
+`/dag_run` 需要 OpenCode 的原生 Workspace 功能，才能在不同 Git worktree 中创建和 Fork Agent 会话。OpenCode 1.19.5 在启动时读取环境变量 `OPENCODE_EXPERIMENTAL_WORKSPACES`，必须在启动 OpenCode 前启用。
+
+**推荐：为当前 Windows 用户永久保存，并立即在当前 PowerShell 窗口生效。** 无需管理员权限：
+
+```powershell
+[Environment]::SetEnvironmentVariable('OPENCODE_EXPERIMENTAL_WORKSPACES', 'true', 'User')
+$env:OPENCODE_EXPERIMENTAL_WORKSPACES = 'true'
+opencode
+```
+
+第一行保存用户级环境变量，第二行更新当前 PowerShell 进程，第三行启动已启用 Workspace 的 OpenCode。已有 OpenCode 进程需要退出后重新启动。
+
+**仅本次启用：** 如果不需要永久保存，只在当前 PowerShell 窗口执行：
 
 ```powershell
 $env:OPENCODE_EXPERIMENTAL_WORKSPACES = 'true'
 opencode
 ```
+
+可在启动前检查当前窗口的值，应输出 `true`：
+
+```powershell
+$env:OPENCODE_EXPERIMENTAL_WORKSPACES
+```
+
+插件也会自动尝试保存用户级开关，但无法让已启动的 OpenCode 重新读取它。如果首次运行提示需要启用 Workspace，请退出 OpenCode，在当前窗口执行上面的 `$env:...` 赋值后重新启动；或者完全退出并重新打开终端应用后再启动。Windows Terminal 仅新建标签页可能仍继承旧环境；从 IDE 内置终端启动时，也可能需要重启 IDE。用户级永久设置不会自动更新这些已打开的进程。
+
+此开关通过环境变量启用，不能用 `opencode.json` / `opencode.jsonc` 中的配置项代替。
 
 ## 使用
 
